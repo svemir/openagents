@@ -6,9 +6,13 @@ namespace App\AI;
 
 use App\Models\Thread;
 use GuzzleHttp\Client;
+use Yethee\Tiktoken\EncoderProvider;
 
 class SimpleInferencer
 {
+    // public until refactor
+    public static float $messageTokens = 0;
+
     public static function inference(string $prompt, string $model, Thread $thread, callable $streamFunction, ?Client $httpClient = null): array
     {
         $modelDetails = Models::MODELS[$model] ?? null;
@@ -21,18 +25,11 @@ class SimpleInferencer
                 [
                     'role' => 'system',
                     'content' => 'You are a helpful assistant.',
-                    // 'content' => 'You are a helpful assistant on OpenAgents.com. Answer the inquiry from the user.',
                 ],
-                ...get_truncated_messages($thread, $maxTokens),
+                ...get_truncated_messages($thread, $maxTokens, $prompt),
             ];
 
-            // Calculate the approximate number of tokens in the messages
-            $messageTokens = array_sum(array_map(function ($message) {
-                return ceil(str_word_count($message['content']) / 3);
-            }, $messages));
-
-            // Adjust the max_tokens value for the completion
-            $completionTokens = $maxTokens - $messageTokens;
+            $completionTokens = $maxTokens - static::$messageTokens;
 
             if (! $httpClient) {
                 $httpClient = new Client();
@@ -85,40 +82,53 @@ class SimpleInferencer
     }
 }
 
-function get_truncated_messages(Thread $thread, int $maxTokens)
+function get_truncated_messages(Thread $thread, int $maxTokens, string $prompt): array
 {
+    $provider = new EncoderProvider();
+    $encoder = $provider->getForModel('gpt-4');
+
     $messages = [];
     $tokenCount = 0;
     $userContent = '';
+    $maxTokensReached = false;
+
+    // leave room for the actual prompt
+    $promptTokens = count($encoder->encode($prompt));
+    $maxTokens -= $promptTokens;
 
     foreach ($thread->messages()->orderBy('created_at', 'asc')->get() as $message) {
-        if ($message->model !== null) {
-            $role = 'assistant';
-        } else {
-            $role = 'user';
+
+        // First check previously stored token count up to this point
+        if ($message->input_tokens) {
+            if ($message->input_tokens > $maxTokens) {
+                $maxTokensReached = true;
+                break;
+            }
+            // input_tokens contains the token count of the entire chat so far
+            $tokenCount = $message->input_tokens;
         }
 
-        if ($role === 'user') {
+        if (is_null($message->model)) {
             if (strtolower(substr($message->body, 0, 11)) === 'data:image/') {
                 $userContent .= ' <image>';
-            } else {
+            } elseif (! str_contains($userContent, $message->body)) {
                 $userContent .= ' '.$message->body;
             }
         } else {
             $userContent = trim($userContent);
             if (! empty($userContent)) {
-                $messageTokens = ceil(str_word_count($userContent) / 3);
-
-                if ($tokenCount + $messageTokens > $maxTokens) {
-                    break; // Stop adding messages if the remaining context is not enough
+                if (! $message->input_tokens) {
+                    $messageTokens = count($encoder->encode($userContent));
+                    if ($tokenCount + $messageTokens > $maxTokens) {
+                        $maxTokensReached = true;
+                        break;
+                    }
+                    $tokenCount += $messageTokens;
                 }
-
                 $messages[] = [
                     'role' => 'user',
                     'content' => $userContent,
                 ];
-
-                $tokenCount += $messageTokens;
                 $userContent = '';
             }
 
@@ -128,13 +138,13 @@ function get_truncated_messages(Thread $thread, int $maxTokens)
                 $content = trim($message->body);
                 if (empty($content)) {
                     // Some LLMs return a 400 error if they receive blank content
-                    continue;
+                    $content = '<blank>';
                 }
             }
 
-            $messageTokens = ceil(str_word_count($content) / 3);
-
+            $messageTokens = $message->output_tokens ?: count($encoder->encode($content));
             if ($tokenCount + $messageTokens > $maxTokens) {
+                $maxTokensReached = true;
                 break; // Stop adding messages if the remaining context is not enough
             }
 
@@ -142,21 +152,34 @@ function get_truncated_messages(Thread $thread, int $maxTokens)
                 'role' => 'assistant',
                 'content' => $content,
             ];
-
             $tokenCount += $messageTokens;
         }
     }
 
-    if (! empty($userContent)) {
-        $messageTokens = ceil(str_word_count($userContent) / 3);
+    $lastRole = $messages ? end($messages)['role'] : '';
 
-        if ($tokenCount + $messageTokens <= $maxTokens) {
-            $messages[] = [
-                'role' => 'user',
-                'content' => trim($userContent),
-            ];
+    if (! $maxTokensReached && ! empty($userContent)) {
+        $messageTokens = count($encoder->encode($userContent));
+        if ($tokenCount + $messageTokens > $maxTokens) {
+            $maxTokensReached = true;
+        } else {
+            $lastRole = '';
         }
     }
+
+    if ($maxTokensReached || ($lastRole === 'assistant')) {
+        $userContent = $prompt;
+        $messageTokens = $promptTokens;
+    }
+
+    if (! empty($userContent)) {
+        $messages[] = [
+            'role' => 'user',
+            'content' => trim($userContent),
+        ];
+        $tokenCount += $messageTokens;
+    }
+    SimpleInferencer::$messageTokens = $tokenCount;
 
     return $messages;
 }
