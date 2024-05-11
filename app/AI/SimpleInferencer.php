@@ -10,8 +10,7 @@ use Yethee\Tiktoken\EncoderProvider;
 
 class SimpleInferencer
 {
-    // public until refactor
-    public static float $messageTokens = 0;
+    private static int $remainingTokens = 0;
 
     public static function inference(string $prompt, string $model, Thread $thread, callable $streamFunction, ?Client $httpClient = null): array
     {
@@ -19,17 +18,15 @@ class SimpleInferencer
 
         if ($modelDetails) {
             $gateway = $modelDetails['gateway'];
-            $maxTokens = $modelDetails['max_tokens'];
+            self::$remainingTokens = $modelDetails['max_tokens'];
 
             $messages = [
                 [
                     'role' => 'system',
                     'content' => 'You are a helpful assistant.',
                 ],
-                ...get_truncated_messages($thread, $maxTokens, $prompt),
+                ...self::getTruncatedMessages($thread),
             ];
-
-            $completionTokens = $maxTokens - static::$messageTokens;
 
             if (! $httpClient) {
                 $httpClient = new Client();
@@ -37,7 +34,7 @@ class SimpleInferencer
             $params = [
                 'model' => $model,
                 'messages' => $messages,
-                'max_tokens' => $completionTokens,
+                'max_tokens' => self::$remainingTokens,
                 'stream_function' => $streamFunction,
             ];
             switch ($gateway) {
@@ -80,106 +77,65 @@ class SimpleInferencer
 
         return $inference;
     }
-}
 
-function get_truncated_messages(Thread $thread, int $maxTokens, string $prompt): array
-{
-    $provider = new EncoderProvider();
-    $encoder = $provider->getForModel('gpt-4');
+    public static function getTruncatedMessages(Thread $thread): array
+    {
+        $provider = new EncoderProvider();
+        $encoder = $provider->getForModel('gpt-4');
 
-    $messages = [];
-    $tokenCount = 0;
-    $userContent = '';
-    $maxTokensReached = false;
+        $messages = [];
+        $userContent = '';
 
-    // leave room for the actual prompt
-    $promptTokens = count($encoder->encode($prompt));
-    $maxTokens -= $promptTokens;
+        foreach ($thread->messages()->orderBy('created_at', 'desc')->get() as $message) {
 
-    foreach ($thread->messages()->orderBy('created_at', 'asc')->get() as $message) {
-
-        // First check previously stored token count up to this point
-        if ($message->input_tokens) {
-            if ($message->input_tokens > $maxTokens) {
-                $maxTokensReached = true;
-                break;
-            }
-            // input_tokens contains the token count of the entire chat so far
-            $tokenCount = $message->input_tokens;
-        }
-
-        if (is_null($message->model)) {
-            if (strtolower(substr($message->body, 0, 11)) === 'data:image/') {
-                $userContent .= ' <image>';
-            } elseif (! str_contains($userContent, $message->body)) {
-                $userContent .= ' '.$message->body;
-            }
-        } else {
-            $userContent = trim($userContent);
-            if (! empty($userContent)) {
-                if (! $message->input_tokens) {
+            if (is_null($message->model)) {
+                if (strtolower(substr($message->body, 0, 11)) === 'data:image/') {
+                    $userContent = '<image> '.$userContent;
+                } elseif (! str_contains($userContent, $message->body)) {
+                    $userContent = $message->body.' '.$userContent;
+                }
+            } else {
+                $userContent = trim($userContent);
+                if (! empty($userContent)) {
                     $messageTokens = count($encoder->encode($userContent));
-                    if ($tokenCount + $messageTokens > $maxTokens) {
-                        $maxTokensReached = true;
+                    self::$remainingTokens -= $messageTokens;
+
+                    array_unshift($messages, [
+                        'role' => 'user',
+                        'content' => $userContent,
+                    ]);
+                    if (self::$remainingTokens < 0) {
                         break;
                     }
-                    $tokenCount += $messageTokens;
+                    $userContent = '';
                 }
-                $messages[] = [
-                    'role' => 'user',
-                    'content' => $userContent,
-                ];
-                $userContent = '';
-            }
 
-            if (strtolower(substr($message->body, 0, 11)) === 'data:image/') {
-                $content = '<image>';
-            } else {
-                $content = trim($message->body);
-                if (empty($content)) {
-                    // Some LLMs return a 400 error if they receive blank content
-                    $content = '<blank>';
+                if (strtolower(substr($message->body, 0, 11)) === 'data:image/') {
+                    $content = '<image>';
+                } else {
+                    $content = trim($message->body);
+                    if (empty($content)) {
+                        // Some LLMs return a 400 error if they receive blank content
+                        $content = '<blank>';
+                    }
+                }
+
+                $messageTokens = $message->output_tokens ?: count($encoder->encode($content));
+                if ($messageTokens <= self::$remainingTokens) {
+                    array_unshift($messages, [
+                        'role' => 'assistant',
+                        'content' => $content,
+                    ]);
+                    self::$remainingTokens -= $messageTokens;
+                    if (self::$remainingTokens < 0) {
+                        break;
+                    }
+                } else {
+                    break;
                 }
             }
-
-            $messageTokens = $message->output_tokens ?: count($encoder->encode($content));
-            if ($tokenCount + $messageTokens > $maxTokens) {
-                $maxTokensReached = true;
-                break; // Stop adding messages if the remaining context is not enough
-            }
-
-            $messages[] = [
-                'role' => 'assistant',
-                'content' => $content,
-            ];
-            $tokenCount += $messageTokens;
         }
+
+        return $messages;
     }
-
-    $lastRole = $messages ? end($messages)['role'] : '';
-
-    if (! $maxTokensReached && ! empty($userContent)) {
-        $messageTokens = count($encoder->encode($userContent));
-        if ($tokenCount + $messageTokens > $maxTokens) {
-            $maxTokensReached = true;
-        } else {
-            $lastRole = '';
-        }
-    }
-
-    if ($maxTokensReached || ($lastRole === 'assistant')) {
-        $userContent = $prompt;
-        $messageTokens = $promptTokens;
-    }
-
-    if (! empty($userContent)) {
-        $messages[] = [
-            'role' => 'user',
-            'content' => trim($userContent),
-        ];
-        $tokenCount += $messageTokens;
-    }
-    SimpleInferencer::$messageTokens = $tokenCount;
-
-    return $messages;
 }
