@@ -12,6 +12,8 @@ class SimpleInferencer
 {
     private static int $remainingTokens = 0;
 
+    private static $encoder;
+
     public static function inference(string $prompt, string $model, Thread $thread, callable $streamFunction, ?Client $httpClient = null): array
     {
         $modelDetails = Models::MODELS[$model] ?? null;
@@ -81,61 +83,45 @@ class SimpleInferencer
     public static function getTruncatedMessages(Thread $thread): array
     {
         $provider = new EncoderProvider();
-        $encoder = $provider->getForModel('gpt-4');
+        self::$encoder = $provider->getForModel('gpt-4');
 
         $messages = [];
-        $userContent = '';
 
         foreach ($thread->messages()->orderBy('created_at', 'desc')->get() as $message) {
+            $role = is_null($message->model) ? 'user' : 'assistant';
 
-            if (is_null($message->model)) {
-                if (strtolower(substr($message->body, 0, 11)) === 'data:image/') {
-                    $userContent = '<image> '.$userContent;
-                } elseif (! str_contains($userContent, $message->body)) {
-                    $userContent = $message->body.' '.$userContent;
-                }
-            } else {
-                $userContent = trim($userContent);
-                if (! empty($userContent)) {
-                    $messageTokens = count($encoder->encode($userContent));
-                    self::$remainingTokens -= $messageTokens;
+            self::addMessage($role, $message, $messages);
 
-                    array_unshift($messages, [
-                        'role' => 'user',
-                        'content' => $userContent,
-                    ]);
-                    if (self::$remainingTokens < 0) {
-                        break;
-                    }
-                    $userContent = '';
-                }
-
-                if (strtolower(substr($message->body, 0, 11)) === 'data:image/') {
-                    $content = '<image>';
-                } else {
-                    $content = trim($message->body);
-                    if (empty($content)) {
-                        // Some LLMs return a 400 error if they receive blank content
-                        $content = '<blank>';
-                    }
-                }
-
-                $messageTokens = $message->output_tokens ?: count($encoder->encode($content));
-                if ($messageTokens <= self::$remainingTokens) {
-                    array_unshift($messages, [
-                        'role' => 'assistant',
-                        'content' => $content,
-                    ]);
-                    self::$remainingTokens -= $messageTokens;
-                    if (self::$remainingTokens < 0) {
-                        break;
-                    }
-                } else {
-                    break;
-                }
+            if (self::$remainingTokens < 0) {
+                break;
             }
         }
 
         return $messages;
+    }
+
+    private static function addMessage(string $role, mixed $message, array &$messages): void
+    {
+        if (strtolower(substr($message->body, 0, 11)) === 'data:image/') {
+            $content = '<image>';
+        } else {
+            $content = trim($message->body) ?: '<blank>';
+        }
+        $messageTokens = $message->output_tokens ?: count(self::$encoder->encode($content));
+
+        if ($messageTokens <= self::$remainingTokens || ($role === 'user')) {
+            self::$remainingTokens -= $messageTokens;
+
+            if (count($messages) && $messages[0]['role'] === $role) {
+                if (! str_contains($messages[0]['content'], $content)) {
+                    $messages[0]['content'] = $messages[0]['content']."\n".$content;
+                }
+            } else {
+                array_unshift($messages, [
+                    'role' => $role,
+                    'content' => $content,
+                ]);
+            }
+        }
     }
 }
